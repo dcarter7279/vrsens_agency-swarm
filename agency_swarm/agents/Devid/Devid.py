@@ -1,7 +1,7 @@
 from typing_extensions import override
 import re
 from agency_swarm.agents import Agent
-from agency_swarm.tools import Retrieval
+from agency_swarm.tools import FileSearch
 from instructor import llm_validator
 
 
@@ -13,9 +13,11 @@ class Devid(Agent):
             instructions="./instructions.md",
             files_folder="./files",
             schemas_folder="./schemas",
-            tools=[Retrieval],
+            tools=[FileSearch],
             tools_folder="./tools",
             validation_attempts=1,
+            temperature=0,
+            max_prompt_tokens=25000,
         )
 
     @override
@@ -36,6 +38,6 @@ class Devid(Agent):
                                 "statements for another attempt. Should the agent outline potential "
                                 "solutions or further actions, direct the agent to execute those plans. "
                                 "Message does not have to contain code snippets. Just confirmation.",
-                      openai_client=self.client)(message)
+                      client=self.client)(message)
 
         return message

@@ -1,6 +1,6 @@
 from agency_swarm.agents import Agent
 from .tools.util.selenium import set_selenium_config
-from agency_swarm.tools.oai import Retrieval
+from agency_swarm.tools.oai import FileSearch
 from typing_extensions import override
 
 
@@ -12,8 +12,10 @@ class BrowsingAgent(Agent):
             instructions="./instructions.md",
             files_folder="./files",
             schemas_folder="./schemas",
-            tools=[Retrieval],
-            tools_folder="./tools"
+            tools=[FileSearch],
+            tools_folder="./tools",
+            temperature = 0,
+            max_prompt_tokens = 25000,
         )
 
         if selenium_config is not None:

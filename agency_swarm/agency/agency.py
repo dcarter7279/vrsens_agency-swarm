@@ -5,9 +5,11 @@ import queue
 import threading
 import uuid
 from enum import Enum
-from typing import List, TypedDict, Callable, Any, Dict, Literal, Union
+from typing import List, TypedDict, Callable, Any, Dict, Literal, Union, Optional
 
+from openai.types.beta import AssistantToolChoice
 from openai.types.beta.threads import Message
+from openai.types.beta.threads.message import Attachment
 from openai.types.beta.threads.runs import RunStep
 from pydantic import Field, field_validator, model_validator
 from rich.console import Console
@@ -17,7 +19,7 @@ from agency_swarm.agents import Agent
 from agency_swarm.messages import MessageOutput
 from agency_swarm.messages.message_output import MessageOutputLive
 from agency_swarm.threads import Thread
-from agency_swarm.tools import BaseTool
+from agency_swarm.tools import BaseTool, FileSearch, CodeInterpreter
 from agency_swarm.user import User
 
 from agency_swarm.util.streaming import AgencyEventHandler
@@ -47,7 +49,12 @@ class Agency:
                  async_mode: Literal['threading'] = None,
                  settings_path: str = "./settings.json",
                  settings_callbacks: SettingsCallbacks = None,
-                 threads_callbacks: ThreadsCallbacks = None):
+                 threads_callbacks: ThreadsCallbacks = None,
+                 temperature: float = None,
+                 max_prompt_tokens: int = None,
+                 max_completion_tokens: int = None,
+                 truncation_strategy: dict = None,
+                 ):
         """
         Initializes the Agency object, setting up agents, threads, and core functionalities.
 
@@ -59,6 +66,10 @@ class Agency:
             settings_path (str, optional): The path to the settings file for the agency. Must be json. If file does not exist, it will be created. Defaults to None.
             settings_callbacks (SettingsCallbacks, optional): A dictionary containing functions to load and save settings for the agency. The keys must be "load" and "save". Both values must be defined. Defaults to None.
             threads_callbacks (ThreadsCallbacks, optional): A dictionary containing functions to load and save threads for the agency. The keys must be "load" and "save". Both values must be defined. Defaults to None.
+            temperature (float, optional): The temperature value to use for the agents. Agent specific values will override this. Defaults to 0.5.
+            max_prompt_tokens (int, optional): The maximum number of tokens allowed in the prompt for each agent. Agent specific values will override this. Defaults to None.
+            max_completion_tokens (int, optional): The maximum number of tokens allowed in the completion for each agent. Agent specific values will override this. Defaults to None.
+            truncation_strategy (dict, optional): The truncation strategy to use for the completion for each agent. Agent specific values will override this. Defaults to None.
 
         This constructor initializes various components of the Agency, including CEO, agents, threads, and user interactions. It parses the agency chart to set up the organizational structure and initializes the messaging tools, agents, and threads necessary for the operation of the agency. Additionally, it prepares a main thread for user interactions.
         """
@@ -78,6 +89,10 @@ class Agency:
         self.settings_path = settings_path
         self.settings_callbacks = settings_callbacks
         self.threads_callbacks = threads_callbacks
+        self.temperature = temperature
+        self.max_prompt_tokens = max_prompt_tokens
+        self.max_completion_tokens = max_completion_tokens
+        self.truncation_strategy = truncation_strategy
 
         if os.path.isfile(os.path.join(self._get_class_folder_path(), shared_instructions)):
             self._read_instructions(os.path.join(self._get_class_folder_path(), shared_instructions))
@@ -91,8 +106,14 @@ class Agency:
         self._init_agents()
         self._init_threads()
 
-    def get_completion(self, message: str, message_files=None, yield_messages=True, recipient_agent=None,
-                       additional_instructions=None):
+    def get_completion(self, message: str,
+                       message_files=None,
+                       yield_messages=False,
+                       recipient_agent=None,
+                       additional_instructions=None,
+                       attachments: List[dict] = None,
+                       tool_choice: dict = None,
+                       ):
         """
         Retrieves the completion for a given message from the main thread.
 
@@ -102,33 +123,39 @@ class Agency:
             yield_messages (bool, optional): Flag to determine if intermediate messages should be yielded. Defaults to True.
             recipient_agent (Agent, optional): The agent to which the message should be sent. Defaults to the first agent in the agency chart.
             additional_instructions (str, optional): Additional instructions to be sent with the message. Defaults to None.
+            attachments (List[dict], optional): A list of attachments to be sent with the message. Defaults to None.
+
         Returns:
             Generator or final response: Depending on the 'yield_messages' flag, this method returns either a generator yielding intermediate messages or the final response from the main thread.
         """
-        gen = self.main_thread.get_completion(message=message, message_files=message_files,
-                                              yield_messages=yield_messages, recipient_agent=recipient_agent,
-                                              additional_instructions=additional_instructions)
+        if yield_messages:
+            print("Warning: yield_messages parameter is deprecated. Use streaming instead.")
 
-        if not yield_messages:
-            while True:
-                try:
-                    next(gen)
-                except StopIteration as e:
-                    return e.value
+        return self.main_thread.get_completion(message=message,
+                                               message_files=message_files,
+                                               attachments=attachments,
+                                               recipient_agent=recipient_agent,
+                                               additional_instructions=additional_instructions,
+                                               tool_choice=tool_choice)
 
-        return gen
-
-    def get_completion_stream(self, message: str, event_handler: type(AgencyEventHandler), message_files=None,
-                              recipient_agent=None, additional_instructions: str = None):
+    def get_completion_stream(self,
+                              message: str,
+                              event_handler: type(AgencyEventHandler),
+                              message_files=None,
+                              recipient_agent=None,
+                              additional_instructions: str = None,
+                              attachments: List[dict] = None,
+                              tool_choice: dict = None):
         """
         Generates a stream of completions for a given message from the main thread.
 
         Parameters:
             message (str): The message for which completion is to be retrieved.
             event_handler (type(AgencyEventHandler)): The event handler class to handle the completion stream. https://github.com/openai/openai-python/blob/main/helpers.md
-            message_files (list, optional): A list of file ids to be sent as attachments with the message. Defaults to None.
+            message_files (list, optional): A list of file ids to be sent as attachments with the message. Tools will be deteremined automaticlly with this parameter. To choose tools yourself use attachments param. Defaults to None.
             recipient_agent (Agent, optional): The agent to which the message should be sent. Defaults to the first agent in the agency chart.
             additional_instructions (str, optional): Additional instructions to be sent with the message. Defaults to None.
+            attachments (List[Attachment], optional): A list of attachments to be sent with the message. Defaults to None.
         Returns:
             Final response: Final response from the main thread.
         """
@@ -138,16 +165,14 @@ class Agency:
         if not inspect.isclass(event_handler):
             raise Exception("Event handler must not be an instance.")
 
-        gen = self.main_thread.get_completion_stream(message=message, event_handler=event_handler,
-                                                     message_files=message_files, recipient_agent=recipient_agent,
-                                                     additional_instructions=additional_instructions)
-
-        while True:
-            try:
-                next(gen)
-            except StopIteration as e:
-                event_handler.on_all_streams_end()
-                return e.value
+        return self.main_thread.get_completion_stream(message=message,
+                                                      message_files=message_files,
+                                                      event_handler=event_handler,
+                                                      attachments=attachments,
+                                                      recipient_agent=recipient_agent,
+                                                      additional_instructions=additional_instructions,
+                                                      tool_choice=tool_choice
+                                                      )
 
     def demo_gradio(self, height=450, dark_mode=True, **kwargs):
         """
@@ -284,7 +309,7 @@ class Agency:
                             args = eval(snapshot.function.arguments)
                             recipient = args["recipient"]
                             self.message_output = MessageOutput("text", self.recipient_agent_name, recipient,
-                                                                    args["message"])
+                                                                args["message"])
 
                             chatbot_queue.put("[new_message]")
                             chatbot_queue.put(self.message_output.get_formatted_content())
@@ -327,7 +352,7 @@ class Agency:
                 # Replace this with your actual chatbot logic
 
                 completion_thread = threading.Thread(target=self.get_completion_stream, args=(
-                original_message, GradioEventHandler, message_file_ids, recipient_agent))
+                    original_message, GradioEventHandler, message_file_ids, recipient_agent))
                 completion_thread.start()
 
                 message_file_ids = []
@@ -441,7 +466,7 @@ class Agency:
 
                 if tool_call.type == "function":
                     self.message_output = MessageOutputLive("function", self.recipient_agent_name, self.agent_name,
-                                                        str(tool_call.function))
+                                                            str(tool_call.function))
 
             @override
             def on_tool_call_delta(self, delta, snapshot):
@@ -549,11 +574,23 @@ class Agency:
             agent.settings_path = self.settings_path
 
             if self.shared_files:
+                if isinstance(self.shared_files, str):
+                    self.shared_files = [self.shared_files]
+
                 if isinstance(agent.files_folder, str):
                     agent.files_folder = [agent.files_folder]
                     agent.files_folder += self.shared_files
                 elif isinstance(agent.files_folder, list):
                     agent.files_folder += self.shared_files
+
+            if self.temperature and agent.temperature is None:
+                agent.temperature = self.temperature
+            if self.max_prompt_tokens and not agent.max_prompt_tokens:
+                agent.max_prompt_tokens = self.max_prompt_tokens
+            if self.max_completion_tokens and not agent.max_completion_tokens:
+                agent.max_completion_tokens = self.max_completion_tokens
+            if self.truncation_strategy and not agent.truncation_strategy:
+                agent.truncation_strategy = self.truncation_strategy
 
             agent.init_oai()
 
@@ -757,19 +794,19 @@ class Agency:
 
         class SendMessage(BaseTool):
             my_primary_instructions: str = Field(...,
-                                      description="Please repeat your primary instructions step-by-step, including both completed "
-                                                  "and the following next steps that you need to perfrom. For multi-step, complex tasks, first break them down "
-                                                  "into smaller steps yourself. Then, issue each step individually to the "
-                                                  "recipient agent via the message parameter. Each identified step should be "
-                                                  "sent in separate message. Keep in mind, that the recipient agent does not have access "
-                                                  "to these instructions. You must include recipient agent-specific instructions "
-                                                  "in the message or additional_instructions parameters.")
+                                                 description="Please repeat your primary instructions step-by-step, including both completed "
+                                                             "and the following next steps that you need to perfrom. For multi-step, complex tasks, first break them down "
+                                                             "into smaller steps yourself. Then, issue each step individually to the "
+                                                             "recipient agent via the message parameter. Each identified step should be "
+                                                             "sent in separate message. Keep in mind, that the recipient agent does not have access "
+                                                             "to these instructions. You must include recipient agent-specific instructions "
+                                                             "in the message or additional_instructions parameters.")
             recipient: recipients = Field(..., description=agent_descriptions)
             message: str = Field(...,
                                  description="Specify the task required for the recipient agent to complete. Focus on "
                                              "clarifying what the task entails, rather than providing exact "
                                              "instructions.")
-            message_files: List[str] = Field(default=None,
+            message_files: Optional[List[str]] = Field(default=None,
                                              description="A list of file ids to be sent as attachments to this message. Only use this if you have the file id that starts with 'file-'.",
                                              examples=["file-1234", "file-5678"])
             additional_instructions: str = Field(default=None,
@@ -778,7 +815,8 @@ class Agency:
 
             @model_validator(mode='after')
             def validate_files(self):
-                if "file-" in self.message or (self.additional_instructions and "file-" in self.additional_instructions):
+                if "file-" in self.message or (
+                        self.additional_instructions and "file-" in self.additional_instructions):
                     if not self.message_files:
                         raise ValueError("You must include file ids in message_files parameter.")
 
@@ -792,15 +830,10 @@ class Agency:
                 thread = outer_self.agents_and_threads[self.caller_agent.name][self.recipient.value]
 
                 if not outer_self.async_mode:
-                    gen = thread.get_completion(message=self.message,
-                                                message_files=self.message_files,
-                                                event_handler=self.event_handler,
-                                                additional_instructions=self.additional_instructions)
-                    try:
-                        while True:
-                            yield next(gen)
-                    except StopIteration as e:
-                        message = e.value
+                    message = thread.get_completion(message=self.message,
+                                                    message_files=self.message_files,
+                                                    event_handler=self.event_handler,
+                                                    additional_instructions=self.additional_instructions)
                 else:
                     message = thread.get_completion_async(message=self.message,
                                                           message_files=self.message_files,
